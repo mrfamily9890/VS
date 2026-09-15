@@ -128,6 +128,10 @@ export function acceptInvitation(payload) {
   })
 }
 
+export function getInvitationPreview(token) {
+  return request(`/api/v1/auth/invitations/${encodeURIComponent(token)}`)
+}
+
 export function createInvitation(token, payload) {
   return request('/api/v1/invitations', {
     method: 'POST',

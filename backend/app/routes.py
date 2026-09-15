@@ -49,6 +49,7 @@ from .schemas import (
     InvitationAccept,
     InvitationAcceptRead,
     InvitationCreate,
+    InvitationPreview,
     InvitationRead,
     InventoryTransactionCreate,
     InventoryTransactionRead,
@@ -610,8 +611,8 @@ def accept_invitation(payload: InvitationAccept, database: Session = Depends(get
     member = User(
         organization_id=invitation.organization_id,
         email=invitation.email,
-        full_name=invitation.full_name,
-        mobile_phone=invitation.mobile_phone,
+        full_name=(payload.full_name or invitation.full_name).strip(),
+        mobile_phone=normalize_mobile_phone(payload.mobile_phone if payload.mobile_phone is not None else invitation.mobile_phone),
         password_hash=hash_password(payload.password),
         supabase_user_id=supabase_user_id,
         role=invitation.role,
@@ -633,6 +634,24 @@ def accept_invitation(payload: InvitationAccept, database: Session = Depends(get
         organization_name=organization.name,
         user=member,
         access_token=create_access_token(str(member.id), member.token_version),
+    )
+
+
+@router.get("/auth/invitations/{token}", response_model=InvitationPreview)
+def preview_invitation(token: str, database: Session = Depends(get_db)) -> InvitationPreview:
+    invitation = database.scalar(select(OrganizationInvitation).where(
+        OrganizationInvitation.token_hash == invitation_token_hash(token)
+    ))
+    if invitation is None or not invitation_is_active(invitation):
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="This invitation is invalid or expired")
+    organization = database.get(Organization, invitation.organization_id)
+    return InvitationPreview(
+        organization_name=organization.name,
+        email=invitation.email,
+        full_name=invitation.full_name,
+        mobile_phone=invitation.mobile_phone,
+        role=invitation.role,
+        expires_at=invitation.expires_at,
     )
 
 
