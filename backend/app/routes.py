@@ -840,6 +840,14 @@ async def razorpay_webhook(request: Request, database: Session = Depends(get_db)
     if not hmac.compare_digest(signature, expected):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Razorpay webhook signature")
     event = json.loads(body)
+    event_id = event.get("id")
+    if event_id:
+        duplicate = database.scalar(select(AuditLog).where(
+            AuditLog.action == "razorpay.webhook.received",
+            AuditLog.entity_id == str(event_id),
+        ))
+        if duplicate is not None:
+            return
     subscription_entity = event.get("payload", {}).get("subscription", {}).get("entity", {})
     subscription_id = subscription_entity.get("id")
     if not subscription_id:
@@ -860,15 +868,25 @@ async def razorpay_webhook(request: Request, database: Session = Depends(get_db)
         request_id=request.headers.get("x-request-id", str(uuid4())),
         changes=json.dumps({"event": event_name}),
     ))
+    if event_id:
+        database.add(AuditLog(
+            organization_id=organization.id,
+            action="razorpay.webhook.received",
+            entity_type="webhook",
+            entity_id=str(event_id),
+            request_id=request.headers.get("x-request-id", str(uuid4())),
+        ))
     database.commit()
 
 
 @router.post("/subscription/verify", response_model=SubscriptionRead)
 def verify_subscription_payment(
     payload: RazorpaySubscriptionVerify,
+    request: Request,
     user: User = Depends(require_roles("owner")),
     database: Session = Depends(get_db),
 ) -> SubscriptionRead:
+    reserve_idempotency_key(request, user, database)
     settings = get_settings()
     if not settings.razorpay_key_secret:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Razorpay verification is not configured")
