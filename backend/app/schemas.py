@@ -74,6 +74,17 @@ class InvitationRead(BaseModel):
 class InvitationAccept(BaseModel):
     token: str = Field(min_length=32)
     password: str = Field(min_length=8)
+    full_name: str | None = Field(default=None, min_length=2, max_length=160)
+    mobile_phone: str | None = Field(default=None, max_length=32)
+
+
+class InvitationPreview(BaseModel):
+    organization_name: str
+    email: EmailStr
+    full_name: str
+    mobile_phone: str | None
+    role: str
+    expires_at: datetime
 
 
 class InvitationAcceptRead(BaseModel):

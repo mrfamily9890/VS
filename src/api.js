@@ -32,19 +32,18 @@ async function request(path, options = {}) {
   return response.json()
 }
 
-function queueOfflineMutation(path, token, payload) {
+function queueOfflineMutation(path, payload) {
   const queue = JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY) || '[]')
   queue.push({
     id: crypto.randomUUID(),
     path,
-    token,
     payload,
     idempotencyKey: crypto.randomUUID(),
   })
   localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(queue))
 }
 
-export async function flushOfflineMutations() {
+export async function flushOfflineMutations(token) {
   const queue = JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY) || '[]')
   const remaining = []
   for (const item of queue) {
@@ -52,7 +51,7 @@ export async function flushOfflineMutations() {
       await request(item.path, {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${item.token}`,
+          Authorization: `Bearer ${token}`,
           'Idempotency-Key': item.idempotencyKey,
         },
         body: JSON.stringify(item.payload),
@@ -98,6 +97,7 @@ export async function updatePassword(password) {
 }
 
 export async function logout() {
+  localStorage.removeItem(OFFLINE_QUEUE_KEY)
   if (useSupabaseAuth) {
     const { error } = await supabase.auth.signOut()
     if (error) throw new Error(error.message)
@@ -126,6 +126,10 @@ export function acceptInvitation(payload) {
     }
     return result
   })
+}
+
+export function getInvitationPreview(token) {
+  return request(`/api/v1/auth/invitations/${encodeURIComponent(token)}`)
 }
 
 export function createInvitation(token, payload) {
@@ -274,14 +278,15 @@ export function createVehicle(token, vehicle) {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
     body: JSON.stringify({
-      registration_number: vehicle.reg,
+      registration_number: vehicle.registration_number ?? vehicle.reg,
       model: vehicle.model,
-      vehicle_type: vehicle.type,
+      vehicle_type: vehicle.vehicle_type ?? vehicle.type,
       depot: vehicle.depot,
-      status: 'Idle / parked',
-      health: 100,
-      odometer_km: 0,
-      driver_name: null,
+      status: vehicle.status ?? 'Idle / parked',
+      health: Number(vehicle.health ?? 100),
+      odometer_km: Number(vehicle.odometer_km ?? 0),
+      driver_name: vehicle.driver_name ?? null,
+      assigned_driver_id: vehicle.assigned_driver_id ?? null,
     }),
   }).then(mapVehicle)
 }
@@ -719,7 +724,7 @@ export function getDriverInspections(token) {
 
 export async function createDriverInspection(token, payload) {
   if (!navigator.onLine) {
-    queueOfflineMutation('/api/v1/driver/inspections', token, payload)
+    queueOfflineMutation('/api/v1/driver/inspections', payload)
     return { queued: true }
   }
   try {
@@ -730,7 +735,7 @@ export async function createDriverInspection(token, payload) {
     })
   } catch (error) {
     if (error instanceof TypeError) {
-      queueOfflineMutation('/api/v1/driver/inspections', token, payload)
+      queueOfflineMutation('/api/v1/driver/inspections', payload)
       return { queued: true }
     }
     throw error
@@ -739,7 +744,7 @@ export async function createDriverInspection(token, payload) {
 
 export async function createDriverIssue(token, payload) {
   if (!navigator.onLine) {
-    queueOfflineMutation('/api/v1/driver/issues', token, payload)
+    queueOfflineMutation('/api/v1/driver/issues', payload)
     return { queued: true }
   }
   try {
@@ -750,7 +755,7 @@ export async function createDriverIssue(token, payload) {
     })
   } catch (error) {
     if (error instanceof TypeError) {
-      queueOfflineMutation('/api/v1/driver/issues', token, payload)
+      queueOfflineMutation('/api/v1/driver/issues', payload)
       return { queued: true }
     }
     throw error
