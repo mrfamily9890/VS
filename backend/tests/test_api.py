@@ -88,6 +88,20 @@ def test_health_and_vehicle_lifecycle(tmp_path: Path, monkeypatch):
             "priority": "Low",
         })
         assert duplicate_idempotent_order.status_code == 409
+        second_org = client.post("/api/v1/auth/signup", json={
+            "organization_name": f"Second Fleet {uuid4().hex[:6]}",
+            "full_name": "Second Owner",
+            "email": f"second-{uuid4().hex[:8]}@example.com",
+            "password": "SecondPassword!123",
+        })
+        assert second_org.status_code == 201
+        second_headers = {"Authorization": f"Bearer {second_org.json()['access_token']}"}
+        assert client.get("/api/v1/vehicles", headers=second_headers).json() == []
+        assert client.patch(
+            f"/api/v1/vehicles/{vehicle_id}",
+            headers=second_headers,
+            json={"model": "Cross tenant attempt"},
+        ).status_code == 404
         work_notifications = client.get("/api/v1/notifications", headers=headers)
         assert work_notifications.status_code == 200
         assert any(item["notification_type"] == "work_order_assigned" for item in work_notifications.json())
