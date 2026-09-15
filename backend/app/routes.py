@@ -2,13 +2,16 @@ import hashlib
 import hmac
 import csv
 import io
+import ipaddress
 import json
 import os
 import re
 import secrets
+import socket
 from html import escape
 from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
@@ -115,6 +118,34 @@ from .schemas import (
 from .storage import download_object, resolve_object, save_upload
 
 router = APIRouter(prefix="/api/v1")
+MAX_IMPORT_BYTES = 2_000_000
+MAX_IMPORT_ROWS = 10_000
+
+
+def validate_telematics_url(value: str, *, resolve_host: bool = False) -> None:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Telematics URL must be an HTTP(S) URL without embedded credentials")
+    hostname = parsed.hostname.lower().rstrip(".")
+    if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".local"):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Telematics URL cannot target a local host")
+    try:
+        addresses = {info[4][0] for info in socket.getaddrinfo(hostname, parsed.port, type=socket.SOCK_STREAM)}
+    except socket.gaierror as error:
+        if resolve_host:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Telematics host could not be resolved") from error
+        return
+    for address in addresses:
+        parsed_address = ipaddress.ip_address(address)
+        if (
+            parsed_address.is_private
+            or parsed_address.is_loopback
+            or parsed_address.is_link_local
+            or parsed_address.is_multicast
+            or parsed_address.is_reserved
+            or parsed_address.is_unspecified
+        ):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Telematics URL cannot target a private or reserved network")
 
 
 def reserve_idempotency_key(request: Request, user: User, database: Session) -> None:
@@ -920,7 +951,7 @@ def list_notification_deliveries(
 
 @router.post("/notification-deliveries/dispatch")
 def dispatch_queued_notifications(
-    user: User = Depends(require_permission("notifications")),
+    user: User = Depends(require_roles("owner")),
     database: Session = Depends(get_db),
 ) -> dict[str, int]:
     deliveries = database.scalars(
@@ -2956,12 +2987,13 @@ def normalize_external_reading(item: dict) -> dict:
 
 
 def sync_telematics_integration(integration: TelematicsIntegration, database: Session) -> dict[str, int | str]:
-    token = integration_credential(integration)
-    if not token:
-        integration.last_sync_status = "missing_credentials"
-        database.commit()
-        return {"integration_id": integration.id, "status": "missing_credentials", "readings": 0, "vehicles_updated": 0}
     try:
+        token = integration_credential(integration)
+        if not token:
+            integration.last_sync_status = "missing_credentials"
+            database.commit()
+            return {"integration_id": integration.id, "status": "missing_credentials", "readings": 0, "vehicles_updated": 0}
+        validate_telematics_url(integration.base_url, resolve_host=True)
         response = httpx.get(
             f"{integration.base_url.rstrip('/')}/{integration.sync_path.lstrip('/')}",
             headers={"Authorization": f"Bearer {token}", "X-Provider": integration.provider},
@@ -3021,7 +3053,7 @@ def sync_telematics_integration(integration: TelematicsIntegration, database: Se
         integration.last_sync_status = "success"
         database.commit()
         return {"integration_id": integration.id, "status": "success", "readings": created, "vehicles_updated": updated}
-    except (httpx.HTTPError, ValueError, TypeError, KeyError):
+    except (httpx.HTTPError, HTTPException, ValueError, TypeError, KeyError):
         integration.last_synced_at = utc_now()
         integration.last_sync_status = "failed"
         database.commit()
@@ -3082,6 +3114,7 @@ def create_telematics_integration(
     user: User = Depends(require_roles("owner", "fleet_manager")),
     database: Session = Depends(get_db),
 ) -> TelematicsIntegration:
+    validate_telematics_url(payload.base_url)
     integration = TelematicsIntegration(organization_id=user.organization_id, **payload.model_dump())
     database.add(integration)
     database.flush()
@@ -3106,6 +3139,7 @@ def update_telematics_integration(
     user: User = Depends(require_roles("owner", "fleet_manager")),
     database: Session = Depends(get_db),
 ) -> TelematicsIntegration:
+    validate_telematics_url(payload.base_url)
     integration = database.scalar(select(TelematicsIntegration).where(
         TelematicsIntegration.id == integration_id,
         TelematicsIntegration.organization_id == user.organization_id,
@@ -3509,6 +3543,14 @@ def export_resource(
     user: User = Depends(get_current_user),
     database: Session = Depends(get_db),
 ) -> Response:
+    required_roles = {
+        "vehicles": {"owner", "fleet_manager"},
+        "components": {"owner", "fleet_manager"},
+        "parts": {"owner", "inventory_manager"},
+        "vendors": {"owner", "inventory_manager"},
+    }
+    if user.role not in required_roles.get(resource, set()):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Role cannot export this resource")
     if resource == "vehicles":
         rows = database.scalars(select(Vehicle).where(Vehicle.organization_id == user.organization_id)).all()
         headers = ["registration_number", "model", "vehicle_type", "depot", "status", "health", "odometer_km"]
@@ -3544,9 +3586,13 @@ async def import_vehicles(
     user: User = Depends(require_permission("fleet")),
     database: Session = Depends(get_db),
 ) -> dict[str, int]:
-    content = (await file.read()).decode("utf-8-sig")
+    content = (await file.read(MAX_IMPORT_BYTES + 1)).decode("utf-8-sig")
+    if len(content.encode("utf-8")) > MAX_IMPORT_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Import file is too large")
     imported = 0
-    for row in csv.DictReader(io.StringIO(content)):
+    for row_number, row in enumerate(csv.DictReader(io.StringIO(content)), start=1):
+        if row_number > MAX_IMPORT_ROWS:
+            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Import contains too many rows")
         registration = row["registration_number"].strip().upper()
         if database.scalar(select(Vehicle).where(Vehicle.organization_id == user.organization_id, Vehicle.registration_number == registration)):
             continue
@@ -3571,9 +3617,13 @@ async def import_parts(
     user: User = Depends(require_permission("inventory")),
     database: Session = Depends(get_db),
 ) -> dict[str, int]:
-    content = (await file.read()).decode("utf-8-sig")
+    content = (await file.read(MAX_IMPORT_BYTES + 1)).decode("utf-8-sig")
+    if len(content.encode("utf-8")) > MAX_IMPORT_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Import file is too large")
     imported = 0
-    for row in csv.DictReader(io.StringIO(content)):
+    for row_number, row in enumerate(csv.DictReader(io.StringIO(content)), start=1):
+        if row_number > MAX_IMPORT_ROWS:
+            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Import contains too many rows")
         sku = row["sku"].strip().upper()
         if database.scalar(select(Part).where(Part.organization_id == user.organization_id, Part.sku == sku)):
             continue
