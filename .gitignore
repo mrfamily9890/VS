@@ -8,3 +8,4 @@ dist/
 *.db
 __pycache__/
 *.py[cod]
+.vercel

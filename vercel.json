@@ -1,0 +1,47 @@
+{
+  "services": {
+    "frontend": {
+      "root": ".",
+      "framework": "vite"
+    },
+    "backend": {
+      "root": "backend",
+      "entrypoint": "app.main:app"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/signup",
+      "destination": "/?page=signup"
+    },
+    {
+      "source": "/app",
+      "destination": "/?page=app"
+    },
+    {
+      "source": "/invite/:token",
+      "destination": "/?page=invite&token=:token"
+    },
+    {
+      "source": "/health",
+      "destination": {
+        "type": "service",
+        "service": "backend"
+      }
+    },
+    {
+      "source": "/api(/.*)?",
+      "destination": {
+        "type": "service",
+        "service": "backend"
+      }
+    },
+    {
+      "source": "/(.*)",
+      "destination": {
+        "type": "service",
+        "service": "frontend"
+      }
+    }
+  ]
+}

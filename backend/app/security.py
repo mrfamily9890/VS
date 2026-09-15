@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import httpx
 import jwt
 from pwdlib import PasswordHash
 
@@ -51,3 +52,31 @@ def decode_supabase_token(token: str) -> dict[str, Any]:
     else:
         raise ValueError("Supabase JWT verification is not configured")
     return payload
+
+
+def provision_supabase_user(email: str, password: str, full_name: str) -> str | None:
+    settings = get_settings()
+    if settings.auth_provider != "supabase" or settings.environment.lower() == "development":
+        return None
+    if not settings.supabase_url or not settings.supabase_service_role_key:
+        raise ValueError("Supabase Auth admin provisioning is not configured")
+    response = httpx.post(
+        f"{settings.supabase_url.rstrip('/')}/auth/v1/admin/users",
+        headers={
+            "Authorization": f"Bearer {settings.supabase_service_role_key}",
+            "apikey": settings.supabase_service_role_key,
+            "Content-Type": "application/json",
+        },
+        json={
+            "email": email,
+            "password": password,
+            "email_confirm": True,
+            "user_metadata": {"full_name": full_name},
+        },
+        timeout=30,
+    )
+    if response.status_code >= 400:
+        if response.status_code in {409, 422}:
+            raise ValueError("A Supabase Auth user with this email already exists")
+        raise ValueError("Supabase Auth rejected the user provisioning request")
+    return str(response.json()["id"])
